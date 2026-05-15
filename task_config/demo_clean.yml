@@ -1,10 +1,15 @@
 # if you want to modify the config, please check the following tutorial first:
 # https://robotwin-platform.github.io/doc/usage/configurations.html
+
+#render_freq: 10
+#visualize_planner_target: true
+#print_planner_target: true
 render_freq: 0
-episode_num: 50
+episode_num: 5
 use_seed: false
-save_freq: 15
-embodiment: [aloha-agilex]
+save_freq: 20
+embodiment: [piper, piper, 0.6]
+#embodiment: [aloha-agilex]
 language_num: 100
 domain_randomization:
   random_background: false
@@ -15,7 +20,7 @@ domain_randomization:
   random_light: false
   crazy_random_light_rate: 0
 camera:
-  head_camera_type: D435
+  head_camera_type: Large_L515
   wrist_camera_type: D435
   collect_head_camera: true
   collect_wrist_camera: true

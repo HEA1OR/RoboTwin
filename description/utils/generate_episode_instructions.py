@@ -154,11 +154,43 @@ def load_scene_info(task_name: str, setting: str, scene_info_path: str) -> Dict[
 def extract_episodes_from_scene_info(scene_info: Dict) -> List[Dict[str, str]]:
     """Extract episode parameters from scene_info."""
     episodes = []
-    for episode_key, episode_data in scene_info.items():
-        if "info" in episode_data:
+    for _, episode_data in scene_info.items():
+        # Legacy format:
+        #   episode_k -> {"info": {...}, ...}
+        if isinstance(episode_data, dict) and "info" in episode_data and isinstance(episode_data["info"], dict):
             episodes.append(episode_data["info"])
-        else:
-            episodes.append(dict())
+            continue
+
+        # Variant format:
+        #   episode_k -> {"with_observer": {...}, "without_observer": {...}}
+        # Prefer successful with_observer, then successful without_observer,
+        # then fallback to any variant that contains "info".
+        if isinstance(episode_data, dict):
+            candidates = []
+            for variant_name in ("with_observer", "without_observer"):
+                variant_data = episode_data.get(variant_name)
+                if isinstance(variant_data, dict):
+                    candidates.append(variant_data)
+
+            def _is_success(d: Dict[str, Any]) -> bool:
+                collect_status = d.get("collect_status", {})
+                return bool(isinstance(collect_status, dict) and collect_status.get("success", False))
+
+            selected = None
+            for cand in candidates:
+                if _is_success(cand) and isinstance(cand.get("info"), dict):
+                    selected = cand
+                    break
+            if selected is None:
+                for cand in candidates:
+                    if isinstance(cand.get("info"), dict):
+                        selected = cand
+                        break
+            if selected is not None:
+                episodes.append(selected.get("info", {}))
+                continue
+
+        episodes.append(dict())
     return episodes
 
 

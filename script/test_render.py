@@ -15,7 +15,10 @@ import torch
 import sapien.core as sapien
 from sapien.utils.viewer import Viewer
 import gymnasium as gym
-import toppra as ta
+try:
+    import toppra as ta
+except Exception:
+    ta = None
 import transforms3d as t3d
 from collections import OrderedDict
 
@@ -36,7 +39,10 @@ import torch
 import sapien.core as sapien
 from sapien.utils.viewer import Viewer
 import gymnasium as gym
-import toppra as ta
+try:
+    import toppra as ta
+except Exception:
+    ta = None
 import transforms3d as t3d
 from collections import OrderedDict
 
@@ -45,7 +51,8 @@ class Sapien_TEST(gym.Env):
 
     def __init__(self):
         super().__init__()
-        ta.setup_logging("CRITICAL")  # hide logging
+        if ta is not None:
+            ta.setup_logging("CRITICAL")  # hide logging
         try:
             self.setup_scene()
             print("\033[32m" + "Render Well" + "\033[0m")

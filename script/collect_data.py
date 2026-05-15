@@ -184,50 +184,77 @@ def run(TASK_ENV, args):
     if args["collect_data"]:
         print("\033[93m" + "[Start Data Collection]" + "\033[0m")
 
-        args["need_plan"] = False
+        args["need_plan"] = True
         args["render_freq"] = 0
         args["save_data"] = True
 
         clear_cache_freq = args["clear_cache_freq"]
+        TASK_ENV.save_dir = args["save_path"]
 
         st_idx = 0
 
-        def exist_hdf5(idx):
-            file_path = os.path.join(args["save_path"], 'data', f'episode{idx}.hdf5')
+        def exist_hdf5(idx, variant):
+            file_path = os.path.join(args["save_path"], f"data_{variant}", f'episode{idx}.hdf5')
             return os.path.exists(file_path)
 
-        while exist_hdf5(st_idx):
+        while exist_hdf5(st_idx, "with_observer") and exist_hdf5(st_idx, "without_observer"):
             st_idx += 1
+
+        variant_specs = [
+            ("with_observer", True),
+            ("without_observer", False),
+        ]
 
         for episode_idx in range(st_idx, args["episode_num"]):
             print(f"\033[34mTask name: {args['task_name']}\033[0m")
+            for variant_name, observer_enabled in variant_specs:
+                print(f"  -> collect variant: {variant_name}")
 
-            TASK_ENV.setup_demo(now_ep_num=episode_idx, seed=seed_list[episode_idx], **args)
+                episode_args = dict(args)
+                episode_args["enable_observer_tracking"] = observer_enabled
+                episode_args["data_variant"] = variant_name
 
-            traj_data = TASK_ENV.load_tran_data(episode_idx)
-            args["left_joint_path"] = traj_data["left_joint_path"]
-            args["right_joint_path"] = traj_data["right_joint_path"]
-            TASK_ENV.set_path_lst(args)
+                TASK_ENV.setup_demo(now_ep_num=episode_idx, seed=seed_list[episode_idx], **episode_args)
 
-            info_file_path = os.path.join(args["save_path"], "scene_info.json")
+                info_file_path = os.path.join(args["save_path"], f"scene_info_{variant_name}.json")
+                legacy_info_file_path = os.path.join(args["save_path"], "scene_info.json")
+                if not os.path.exists(info_file_path):
+                    with open(info_file_path, "w", encoding="utf-8") as file:
+                        json.dump({}, file, ensure_ascii=False)
+                if not os.path.exists(legacy_info_file_path):
+                    with open(legacy_info_file_path, "w", encoding="utf-8") as file:
+                        json.dump({}, file, ensure_ascii=False)
 
-            if not os.path.exists(info_file_path):
+                with open(info_file_path, "r", encoding="utf-8") as file:
+                    info_db = json.load(file)
+
+                info = TASK_ENV.play_once()
+                collect_success = bool(TASK_ENV.plan_success and TASK_ENV.check_success())
+                if isinstance(info, dict):
+                    info.setdefault("collect_status", {})
+                    info["collect_status"]["success"] = collect_success
+                    info["collect_status"]["variant"] = variant_name
+                    info["collect_status"]["seed"] = int(seed_list[episode_idx])
+                info_db[f"episode_{episode_idx}"] = info
+
                 with open(info_file_path, "w", encoding="utf-8") as file:
-                    json.dump({}, file, ensure_ascii=False)
+                    json.dump(info_db, file, ensure_ascii=False, indent=4)
+                with open(legacy_info_file_path, "r", encoding="utf-8") as file:
+                    legacy_info_db = json.load(file)
+                if f"episode_{episode_idx}" not in legacy_info_db:
+                    legacy_info_db[f"episode_{episode_idx}"] = {}
+                legacy_info_db[f"episode_{episode_idx}"][variant_name] = info
+                with open(legacy_info_file_path, "w", encoding="utf-8") as file:
+                    json.dump(legacy_info_db, file, ensure_ascii=False, indent=4)
 
-            with open(info_file_path, "r", encoding="utf-8") as file:
-                info_db = json.load(file)
-
-            info = TASK_ENV.play_once()
-            info_db[f"episode_{episode_idx}"] = info
-
-            with open(info_file_path, "w", encoding="utf-8") as file:
-                json.dump(info_db, file, ensure_ascii=False, indent=4)
-
-            TASK_ENV.close_env(clear_cache=((episode_idx + 1) % clear_cache_freq == 0))
-            TASK_ENV.merge_pkl_to_hdf5_video()
-            TASK_ENV.remove_data_cache()
-            assert TASK_ENV.check_success(), "Collect Error"
+                if not collect_success:
+                    print(
+                        f"[WARN] Collect failed for episode {episode_idx}, variant={variant_name}, "
+                        f"seed={seed_list[episode_idx]} (continue)"
+                    )
+                TASK_ENV.close_env(clear_cache=((episode_idx + 1) % clear_cache_freq == 0))
+                TASK_ENV.merge_pkl_to_hdf5_video()
+                TASK_ENV.remove_data_cache()
 
         command = f"cd description && bash gen_episode_instructions.sh {args['task_name']} {args['task_config']} {args['language_num']}"
         os.system(command)

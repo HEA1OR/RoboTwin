@@ -4,7 +4,10 @@ import numpy as np
 import pdb
 import traceback
 import numpy as np
-import toppra as ta
+try:
+    import toppra as ta
+except Exception:
+    ta = None
 from mplib.sapien_utils import SapienPlanner, SapienPlanningWorld
 import transforms3d as t3d
 import envs._GLOBAL_CONFIGS as CONFIGS
@@ -37,7 +40,8 @@ try:
             yml_path=None,
         ):
             super().__init__()
-            ta.setup_logging("CRITICAL")  # hide logging
+            if ta is not None:
+                ta.setup_logging("CRITICAL")  # hide logging
             logger.setup_logger(level="error", logger_name="'curobo")
 
             if yml_path != None:
@@ -290,7 +294,8 @@ class MplibPlanner:
         scene=None,
     ):
         super().__init__()
-        ta.setup_logging("CRITICAL")  # hide logging
+        if ta is not None:
+            ta.setup_logging("CRITICAL")  # hide logging
 
         links = [link.get_name() for link in robot_entity.get_links()]
         joints = [joint.get_name() for joint in robot_entity.get_active_joints()]

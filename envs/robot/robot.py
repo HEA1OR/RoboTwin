@@ -3,7 +3,10 @@ import numpy as np
 import pdb
 from .planner import MplibPlanner
 import numpy as np
-import toppra as ta
+try:
+    import toppra as ta
+except Exception:
+    ta = None
 import math
 import yaml
 import os
@@ -20,12 +23,18 @@ class Robot:
 
     def __init__(self, scene, need_topp=False, **kwargs):
         super().__init__()
-        ta.setup_logging("CRITICAL")  # hide logging
+        if ta is not None:
+            ta.setup_logging("CRITICAL")  # hide logging
         self._init_robot_(scene, need_topp, **kwargs)
 
     def _init_robot_(self, scene, need_topp=False, **kwargs):
         # self.dual_arm = dual_arm_tag
         # self.plan_success = True
+        self.scene = scene
+        self.visualize_planner_target = kwargs.get("visualize_planner_target", False)
+        self.print_planner_target = kwargs.get("print_planner_target", False)
+        self.last_planner_target_pose = {"left": None, "right": None}
+        self.planner_target_markers = {"left": None, "right": None}
 
         self.left_js = None
         self.right_js = None
@@ -120,6 +129,41 @@ class Robot:
 
         self.left_entity.set_root_pose(self.left_entity_origion_pose)
         self.right_entity.set_root_pose(self.right_entity_origion_pose)
+
+    def _create_planner_target_marker(self, arm_tag):
+        if not self.visualize_planner_target:
+            return None
+
+        marker = self.planner_target_markers.get(arm_tag)
+        if marker is not None:
+            return marker
+
+        color = (1.0, 0.2, 0.2) if arm_tag == "left" else (0.2, 0.4, 1.0)
+        builder = self.scene.create_actor_builder()
+        builder.set_physx_body_type("static")
+        builder.add_box_visual(half_size=[0.012, 0.012, 0.012], material=color)
+
+        marker_name = f"{arm_tag}_planner_target_marker"
+        marker = builder.build(name=marker_name)
+        marker.set_name(marker_name)
+        self.planner_target_markers[arm_tag] = marker
+        return marker
+
+    def _record_planner_target_pose(self, arm_tag, target_pose):
+        pose_list = target_pose.p.tolist() + target_pose.q.tolist()
+        self.last_planner_target_pose[arm_tag] = pose_list
+
+        if self.print_planner_target:
+            target_pos = np.round(np.array(target_pose.p), 4).tolist()
+            print(f"[Robot] {arm_tag} planner target ee position: {target_pos}")
+
+        marker = self._create_planner_target_marker(arm_tag)
+        if marker is not None:
+            marker.set_pose(target_pose)
+
+    def get_last_planner_target_pose(self, arm_tag):
+        return self.last_planner_target_pose.get(arm_tag)
+
 
     def reset(self, scene, need_topp=False, **kwargs):
         self._init_robot_(scene, need_topp, **kwargs)
@@ -438,6 +482,7 @@ class Robot:
             now_qpos = deepcopy(last_qpos)
 
         trans_target_pose = self._trans_from_gripper_to_endlink(target_pose, arm_tag="left")
+        self._record_planner_target_pose("left", trans_target_pose)
 
         if self.communication_flag:
             self.left_conn.send({
@@ -472,6 +517,7 @@ class Robot:
             now_qpos = deepcopy(last_qpos)
 
         trans_target_pose = self._trans_from_gripper_to_endlink(target_pose, arm_tag="right")
+        self._record_planner_target_pose("right", trans_target_pose)
 
         if self.communication_flag:
             self.right_conn.send({

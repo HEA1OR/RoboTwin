@@ -6,7 +6,10 @@ from sapien.utils.viewer import Viewer
 import numpy as np
 import gymnasium as gym
 import pdb
-import toppra as ta
+try:
+    import toppra as ta
+except Exception:
+    ta = None
 import json
 import transforms3d as t3d
 from collections import OrderedDict
@@ -54,7 +57,8 @@ class Base_Task(gym.Env):
         - `self.render_fre`: Render frequency.
         """
         super().__init__()
-        ta.setup_logging("CRITICAL")  # hide logging
+        if ta is not None:
+            ta.setup_logging("CRITICAL")  # hide logging
         np.random.seed(kwags.get("seed", 0))
         torch.manual_seed(kwags.get("seed", 0))
         # random.seed(kwags.get('seed', 0))
@@ -110,10 +114,17 @@ class Base_Task(gym.Env):
         self.eval_success = False
         self.table_z_bias = (np.random.uniform(low=-self.random_table_height, high=0) + table_height_bias)  # TODO
         self.need_plan = kwags.get("need_plan", True)
+        self.enable_observer_tracking = kwags.get("enable_observer_tracking", True)
         self.left_joint_path = kwags.get("left_joint_path", [])
         self.right_joint_path = kwags.get("right_joint_path", [])
         self.left_cnt = 0
         self.right_cnt = 0
+        self.observer_tracking_segment_num = int(kwags.get("observer_tracking_segment_num", 5))
+        self.observer_follow_min_distance_m = float(kwags.get("observer_follow_min_distance_m", 0.30))
+        self.observer_online_update_interval = int(kwags.get("observer_online_update_interval", 5))
+        self.data_variant = kwags.get("data_variant", "")
+        self.frame_operator_arm_tag = "none"
+        self.frame_observer_arm_tag = "none"
 
         self.instruction = None  # for Eval
 
@@ -442,6 +453,7 @@ class Base_Task(gym.Env):
             "pointcloud": [],
             "joint_action": {},
             "endpose": {},
+            "frame_tracking": {},
         }
 
         pkl_dic["observation"] = self.cameras.get_config()
@@ -496,6 +508,67 @@ class Base_Task(gym.Env):
         if self.data_type.get("pointcloud", False):
             pkl_dic["pointcloud"] = self.cameras.get_pcd(self.data_type.get("conbine", False))
 
+        left_jointstate = self.robot.get_left_arm_jointState()
+        right_jointstate = self.robot.get_right_arm_jointState()
+        left_endpose = np.asarray(self.get_arm_pose("left"), dtype=np.float64)
+        right_endpose = np.asarray(self.get_arm_pose("right"), dtype=np.float64)
+
+        pkl_dic["frame_tracking"]["left_arm_joint"] = np.asarray(left_jointstate[:-1], dtype=np.float64)
+        pkl_dic["frame_tracking"]["right_arm_joint"] = np.asarray(right_jointstate[:-1], dtype=np.float64)
+        pkl_dic["frame_tracking"]["left_arm_endpose"] = left_endpose
+        pkl_dic["frame_tracking"]["right_arm_endpose"] = right_endpose
+        observer_arm_tag = self.frame_observer_arm_tag if self.frame_observer_arm_tag in ["left", "right"] else "none"
+        pkl_dic["frame_tracking"]["observer_arm"] = observer_arm_tag
+
+        observer_spherical = np.zeros(3, dtype=np.float64)
+        observer_offset_angles = np.zeros(2, dtype=np.float64)
+
+        if self.frame_operator_arm_tag in ["left", "right"] and observer_arm_tag in ["left", "right"]:
+            operator_endpose = left_endpose if self.frame_operator_arm_tag == "left" else right_endpose
+            observer_endpose = left_endpose if observer_arm_tag == "left" else right_endpose
+
+            operator_pos = operator_endpose[:3]
+            observer_pos = observer_endpose[:3]
+            rel_vec_world = observer_pos - operator_pos
+            if self.frame_operator_arm_tag == "left":
+                operator_base_q = np.asarray(self.robot.left_entity_origion_pose.q, dtype=np.float64)
+            else:
+                operator_base_q = np.asarray(self.robot.right_entity_origion_pose.q, dtype=np.float64)
+            # Transform to operator-arm base frame so azimuth 0 deg is aligned with base +x axis.
+            operator_base_R = t3d.quaternions.quat2mat(operator_base_q)
+            rel_vec = operator_base_R.T @ rel_vec_world
+            radius = float(np.linalg.norm(rel_vec))
+            if radius > 1e-8:
+                # Spherical definition:
+                # azimuth_deg in [-180, 180], 0 at +x in base XY plane
+                # polar_deg in [0, 180], 0 at +z, 180 at -z
+                azimuth_deg = float(np.degrees(np.arctan2(rel_vec[1], rel_vec[0])))
+                polar_deg = float(np.degrees(np.arccos(np.clip(rel_vec[2] / radius, -1.0, 1.0))))
+                observer_spherical[:] = [radius, azimuth_deg, polar_deg]
+
+            observer_forward_world = t3d.quaternions.quat2mat(observer_endpose[3:])[:, 0]
+            # Zero offset means observer forward points to sphere center (operator end-effector).
+            target_forward_world = operator_pos - observer_pos
+            observer_forward = operator_base_R.T @ observer_forward_world
+            target_forward = operator_base_R.T @ target_forward_world
+            target_norm = np.linalg.norm(target_forward)
+            fwd_norm = np.linalg.norm(observer_forward)
+            if target_norm > 1e-8 and fwd_norm > 1e-8:
+                target_forward = target_forward / target_norm
+                observer_forward = observer_forward / fwd_norm
+
+                obs_azimuth = float(np.degrees(np.arctan2(observer_forward[1], observer_forward[0])))
+                obs_polar = float(np.degrees(np.arccos(np.clip(observer_forward[2], -1.0, 1.0))))
+                tar_azimuth = float(np.degrees(np.arctan2(target_forward[1], target_forward[0])))
+                tar_polar = float(np.degrees(np.arccos(np.clip(target_forward[2], -1.0, 1.0))))
+
+                offset_azimuth = (obs_azimuth - tar_azimuth + 180.0) % 360.0 - 180.0
+                offset_polar = np.clip(obs_polar - tar_polar, -180.0, 180.0)
+                observer_offset_angles[:] = [offset_azimuth, offset_polar]
+
+        pkl_dic["frame_tracking"]["observer_in_operator_spherical"] = observer_spherical
+        pkl_dic["frame_tracking"]["observer_dir_offset_angles"] = observer_offset_angles
+
         self.now_obs = deepcopy(pkl_dic)
         return pkl_dic
 
@@ -512,7 +585,8 @@ class Base_Task(gym.Env):
         print("saving: episode = ", self.ep_num, " index = ", self.FRAME_IDX, end="\r")
 
         if self.FRAME_IDX == 0:
-            self.folder_path = {"cache": f"{self.save_dir}/.cache/episode{self.ep_num}/"}
+            cache_variant_suffix = f"_{self.data_variant}" if self.data_variant else ""
+            self.folder_path = {"cache": f"{self.save_dir}/.cache/episode{self.ep_num}{cache_variant_suffix}/"}
 
             for directory in self.folder_path.values():  # remove previous data
                 if os.path.exists(directory):
@@ -524,12 +598,29 @@ class Base_Task(gym.Env):
         save_pkl(self.folder_path["cache"] + f"{self.FRAME_IDX}.pkl", pkl_dic)  # use cache
         self.FRAME_IDX += 1
 
+    def _serialize_joint_path_for_print(self, data):
+        if isinstance(data, np.ndarray):
+            return data.tolist()
+        if isinstance(data, dict):
+            return {key: self._serialize_joint_path_for_print(val) for key, val in data.items()}
+        if isinstance(data, list):
+            return [self._serialize_joint_path_for_print(item) for item in data]
+        if isinstance(data, tuple):
+            return tuple(self._serialize_joint_path_for_print(item) for item in data)
+        return data
+
+    def _print_left_joint_path_debug(self, stage: str, episode_idx: int, left_joint_path):
+        serialized_path = self._serialize_joint_path_for_print(left_joint_path)
+        print(f"\n[DEBUG][{stage}] episode{episode_idx} left_joint_path:")
+        print(serialized_path)
+
     def save_traj_data(self, idx):
         file_path = os.path.join(self.save_dir, "_traj_data", f"episode{idx}.pkl")
         traj_data = {
             "left_joint_path": deepcopy(self.left_joint_path),
             "right_joint_path": deepcopy(self.right_joint_path),
         }
+        #self._print_left_joint_path_debug("SAVE", idx, traj_data["left_joint_path"])
         save_pkl(file_path, traj_data)
 
     def load_tran_data(self, idx):
@@ -543,11 +634,19 @@ class Base_Task(gym.Env):
         if not self.save_data:
             return
         cache_path = self.folder_path["cache"]
-        target_file_path = f"{self.save_dir}/data/episode{self.ep_num}.hdf5"
-        target_video_path = f"{self.save_dir}/video/episode{self.ep_num}.mp4"
+        data_dir = f"data_{self.data_variant}" if self.data_variant else "data"
+        video_dir = f"video_{self.data_variant}" if self.data_variant else "video"
+        video_left_dir = f"video_left_{self.data_variant}" if self.data_variant else "video_left"
+        video_right_dir = f"video_right_{self.data_variant}" if self.data_variant else "video_right"
+        target_file_path = f"{self.save_dir}/{data_dir}/episode{self.ep_num}.hdf5"
+        target_video_path = {
+            "head_camera": f"{self.save_dir}/{video_dir}/episode{self.ep_num}.mp4",
+            "left_camera": f"{self.save_dir}/{video_left_dir}/episode{self.ep_num}.mp4",
+            "right_camera": f"{self.save_dir}/{video_right_dir}/episode{self.ep_num}.mp4",
+        }
         # print('Merging pkl to hdf5: ', cache_path, ' -> ', target_file_path)
 
-        os.makedirs(f"{self.save_dir}/data", exist_ok=True)
+        os.makedirs(f"{self.save_dir}/{data_dir}", exist_ok=True)
         process_folder_to_hdf5_video(cache_path, target_file_path, target_video_path)
 
     def remove_data_cache(self):
@@ -571,6 +670,7 @@ class Base_Task(gym.Env):
         self.need_plan = args.get("need_plan", True)
         self.left_joint_path = args.get("left_joint_path", [])
         self.right_joint_path = args.get("right_joint_path", [])
+        #self._print_left_joint_path_debug("REPLAY", self.ep_num, self.left_joint_path)
 
     def _set_eval_video_ffmpeg(self, ffmpeg):
         self.eval_video_ffmpeg = ffmpeg
@@ -800,6 +900,7 @@ class Base_Task(gym.Env):
         use_point_cloud=False,
         use_attach=False,
         save_freq=-1,
+        observer_follow_cfg: dict | None = None,
     ):
         """
         Interpolative planning with screw motion.
@@ -837,6 +938,7 @@ class Base_Task(gym.Env):
                 self.plan_success = False
                 return  # TODO
 
+        self._update_frame_tracking_tags(observer_follow_cfg)
         if save_freq != None:
             self._take_picture()
 
@@ -868,16 +970,20 @@ class Base_Task(gym.Env):
                 )
                 now_right_id += 1
 
+            self._update_frame_tracking_tags(observer_follow_cfg)
             self.scene.step()
             if self.render_freq and i % self.render_freq == 0:
                 self._update_render()
                 self.viewer.render()
 
             if save_freq != None and i % save_freq == 0:
+                # Refresh tags after stepping so saved frame labels match current robot state.
+                self._update_frame_tracking_tags(observer_follow_cfg)
                 self._update_render()
                 self._take_picture()
             i += 1
 
+        self._update_frame_tracking_tags(observer_follow_cfg)
         if save_freq != None:
             self._take_picture()
 
@@ -886,6 +992,7 @@ class Base_Task(gym.Env):
         actions_by_arm1: tuple[ArmTag, list[Action]],
         actions_by_arm2: tuple[ArmTag, list[Action]] = None,
         save_freq=-1,
+        observer_follow_cfg: dict | None = None,
     ):
         """
         Take action for the robot.
@@ -916,7 +1023,16 @@ class Base_Task(gym.Env):
         left_actions += [None] * (max_len - len(left_actions))
         right_actions += [None] * (max_len - len(right_actions))
 
+        action_idx = 0
         for left, right in zip(left_actions, right_actions):
+            step_observer_cfg = observer_follow_cfg
+            if observer_follow_cfg is not None and "follow_active_by_action" in observer_follow_cfg:
+                flags = observer_follow_cfg["follow_active_by_action"]
+                force_follow_active = None
+                if isinstance(flags, list) and action_idx < len(flags):
+                    force_follow_active = bool(flags[action_idx])
+                step_observer_cfg = dict(observer_follow_cfg)
+                step_observer_cfg["force_follow_active"] = force_follow_active
 
             if (left is not None and left.arm_tag != "left") or (right is not None
                                                                  and right.arm_tag != "right"):  # check
@@ -929,9 +1045,11 @@ class Base_Task(gym.Env):
                     right_target_pose=right.target_pose,
                     left_constraint_pose=left.args.get("constraint_pose"),
                     right_constraint_pose=right.args.get("constraint_pose"),
+                    observer_follow_cfg=step_observer_cfg,
                 )
                 if self.plan_success is False:
                     return False
+                action_idx += 1
                 continue  # TODO
             else:
                 control_seq = {
@@ -963,9 +1081,214 @@ class Base_Task(gym.Env):
                     if self.plan_success is False:
                         return False
 
-            self.take_dense_action(control_seq)
+            self.take_dense_action(control_seq, observer_follow_cfg=step_observer_cfg)
+            action_idx += 1
 
         return True
+
+    def _interpolate_pose_linear(self, start_pose: np.ndarray, end_pose: np.ndarray, alpha: float) -> list[float]:
+        start_pose = np.asarray(start_pose, dtype=np.float64)
+        end_pose = np.asarray(end_pose, dtype=np.float64)
+        alpha = float(np.clip(alpha, 0.0, 1.0))
+
+        interp_pos = (1.0 - alpha) * start_pose[:3] + alpha * end_pose[:3]
+        interp_quat = (1.0 - alpha) * start_pose[3:] + alpha * end_pose[3:]
+        quat_norm = np.linalg.norm(interp_quat)
+        if quat_norm < 1e-8:
+            interp_quat = end_pose[3:].copy()
+            quat_norm = np.linalg.norm(interp_quat)
+        if quat_norm < 1e-8:
+            interp_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+        else:
+            interp_quat = interp_quat / quat_norm
+        return np.concatenate([interp_pos, interp_quat]).tolist()
+
+    def _get_observer_home_pose(self, observer_arm_tag: ArmTag) -> list[float]:
+        observer_arm_tag = ArmTag(observer_arm_tag)
+        if observer_arm_tag == "left":
+            return list(self.robot.left_original_pose)
+        return list(self.robot.right_original_pose)
+
+    def _should_observer_follow(self, operator_arm_tag: ArmTag, operator_pos: np.ndarray) -> bool:
+        operator_arm_tag = ArmTag(operator_arm_tag)
+        operator_pos = np.asarray(operator_pos, dtype=np.float64)
+        operator_base = (
+            np.asarray(self.robot.left_entity_origion_pose.p, dtype=np.float64)
+            if operator_arm_tag == "left"
+            else np.asarray(self.robot.right_entity_origion_pose.p, dtype=np.float64)
+        )
+        return float(np.linalg.norm(operator_pos - operator_base)) > self.observer_follow_min_distance_m
+
+    def _get_observer_focus_point(
+        self,
+        operator_arm_tag: ArmTag,
+        observer_arm_tag: ArmTag,
+        operator_pos: np.ndarray,
+    ) -> np.ndarray:
+        return np.asarray(operator_pos, dtype=np.float64)
+
+    def _compute_weighted_observer_direction(
+        self,
+        direction: np.ndarray,
+        operator_arm_tag: ArmTag,
+        observer_arm_tag: ArmTag,
+        operator_pos: np.ndarray,
+        observer_pos: np.ndarray,
+    ) -> np.ndarray:
+        direction = np.asarray(direction, dtype=np.float64)
+        operator_pos = np.asarray(operator_pos, dtype=np.float64)
+        observer_pos = np.asarray(observer_pos, dtype=np.float64)
+
+        norm = np.linalg.norm(direction)
+        if norm < 1e-6:
+            return np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        direction = direction / norm
+
+        theta = np.arctan2(direction[2], np.linalg.norm(direction[:2]))
+        phi = np.arctan2(direction[1], direction[0])
+
+        delta_theta_deg = float(getattr(self, "OBSERVER_DELTA_THETA_DEG", 0.0))
+        delta_phi_deg = float(getattr(self, "OBSERVER_DELTA_PHI_DEG", 0.0))
+        if abs(delta_theta_deg) < 1e-8 and abs(delta_phi_deg) < 1e-8:
+            return direction
+
+        world_up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        if abs(np.dot(world_up, direction)) > 0.95:
+            world_up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+
+        cam_left = np.cross(world_up, direction)
+        cam_left_norm = np.linalg.norm(cam_left)
+        if cam_left_norm < 1e-6:
+            return direction
+        cam_left = cam_left / cam_left_norm
+        cam_up = np.cross(direction, cam_left)
+        cam_up = cam_up / np.linalg.norm(cam_up)
+        cam_right = -cam_left
+
+        focus_point = np.asarray(
+            self._get_observer_focus_point(operator_arm_tag, observer_arm_tag, operator_pos),
+            dtype=np.float64,
+        )
+        focus_vec = focus_point - observer_pos
+        focus_depth = float(np.dot(focus_vec, direction))
+        if focus_depth <= 1e-6:
+            return direction
+
+        horizontal = float(np.dot(focus_vec, cam_right) / max(focus_depth, 1e-3))
+        vertical = float(np.dot(focus_vec, cam_up) / max(focus_depth, 1e-3))
+        horizontal = float(np.clip(horizontal, -1.0, 1.0))
+        vertical = float(np.clip(vertical, -1.0, 1.0))
+        weight = float(np.clip(np.sqrt(horizontal**2 + vertical**2), 0.0, 1.0))
+
+        theta += np.deg2rad(delta_theta_deg * weight * vertical)
+        phi += np.deg2rad(delta_phi_deg * weight * horizontal)
+
+        cos_theta = np.cos(theta)
+        return np.array(
+            [cos_theta * np.cos(phi), cos_theta * np.sin(phi), np.sin(theta)],
+            dtype=np.float64,
+        )
+
+    def _update_frame_tracking_tags(self, observer_follow_cfg: dict | None = None):
+        self.frame_operator_arm_tag = "none"
+        self.frame_observer_arm_tag = "none"
+        if observer_follow_cfg is None or not self.enable_observer_tracking:
+            return
+
+        operator_arm_tag = ArmTag(observer_follow_cfg["operator_arm_tag"])
+        observer_arm_tag = ArmTag(observer_follow_cfg["observer_arm_tag"])
+        self.frame_operator_arm_tag = str(operator_arm_tag)
+
+        operator_pose = np.asarray(self.get_arm_pose(operator_arm_tag), dtype=np.float64)
+        operator_pos = operator_pose[:3]
+        current_follow_active = self._should_observer_follow(operator_arm_tag, operator_pos)
+
+        force_follow_active = observer_follow_cfg.get("force_follow_active", None)
+        if force_follow_active is None:
+            follow_active = current_follow_active
+        else:
+            # When segmented flags are provided, use them as the source of truth per sub-target.
+            follow_active = bool(force_follow_active)
+        if follow_active:
+            self.frame_observer_arm_tag = str(observer_arm_tag)
+
+    def _move_with_observer_tracking_by_mode(
+        self,
+        operator_action_seq: tuple[ArmTag, list[Action]],
+        operator_arm_tag: ArmTag,
+        observer_action_seq: tuple[ArmTag, list[Action]] | None = None,
+    ):
+        segment_num = max(1, int(self.observer_tracking_segment_num))
+        operator_arm_tag = ArmTag(operator_arm_tag)
+        observer_arm_tag = operator_arm_tag.opposite
+        operator_actions = operator_action_seq[1] if operator_action_seq[1] is not None else []
+
+        if not any(action.action == "move" for action in operator_actions):
+            return self.move(operator_action_seq)
+
+        current_operator_pose = np.asarray(self.get_arm_pose(operator_arm_tag), dtype=np.float64)
+        segmented_operator_actions = []
+        segmented_follow_active = []
+
+        for action in operator_actions:
+            if action.action != "move":
+                segmented_operator_actions.append(action)
+                segmented_follow_active.append(
+                    self._should_observer_follow(
+                        operator_arm_tag,
+                        np.asarray(current_operator_pose[:3], dtype=np.float64),
+                    )
+                )
+                continue
+
+            target_pose = np.asarray(action.target_pose, dtype=np.float64)
+            for idx in range(1, max(1, segment_num) + 1):
+                alpha = idx / segment_num
+                interp_pose = self._interpolate_pose_linear(current_operator_pose, target_pose, alpha)
+                segmented_operator_actions.append(
+                    Action(operator_arm_tag, "move", target_pose=interp_pose, **action.args)
+                )
+                segmented_follow_active.append(
+                    self._should_observer_follow(operator_arm_tag, np.asarray(interp_pose[:3], dtype=np.float64))
+                )
+            current_operator_pose = target_pose
+
+        segmented_operator_seq = (operator_arm_tag, segmented_operator_actions)
+        if not self.enable_observer_tracking:
+            return self.move(segmented_operator_seq)
+
+        if self.need_plan:
+            segmented_observer_actions = []
+            for action, follow_active in zip(segmented_operator_actions, segmented_follow_active):
+                if action.action != "move":
+                    segmented_observer_actions.append(None)
+                    continue
+                observer_pose = self._sample_observer_tracking_pose(
+                    operator_arm_tag,
+                    action.target_pose,
+                    force_follow_active=bool(follow_active),
+                )
+                segmented_observer_actions.append(Action(observer_arm_tag, "move", target_pose=observer_pose))
+            segmented_observer_seq = (observer_arm_tag, segmented_observer_actions)
+            return self.move(
+                segmented_operator_seq,
+                segmented_observer_seq,
+                observer_follow_cfg={
+                    "operator_arm_tag": str(operator_arm_tag),
+                    "observer_arm_tag": str(observer_arm_tag),
+                    "tracking_only": True,
+                    "follow_active_by_action": segmented_follow_active,
+                },
+            )
+
+        return self.move(
+            segmented_operator_seq,
+            observer_follow_cfg={
+                "operator_arm_tag": str(operator_arm_tag),
+                "observer_arm_tag": str(observer_arm_tag),
+                "follow_active_by_action": segmented_follow_active,
+            },
+        )
 
     def get_gripper_actor_contact_position(self, actor_name):
         contacts = self.scene.get_contacts()
@@ -1402,9 +1725,14 @@ class Base_Task(gym.Env):
         else:
             raise ValueError(f'arm_tag must be either "left" or "right", not {arm_tag}')
 
+    def get_planner_target_pose(self, arm_tag: ArmTag):
+        if arm_tag in ["left", "right"]:
+            return self.robot.get_last_planner_target_pose(arm_tag)
+        raise ValueError(f'arm_tag must be either "left" or "right", not {arm_tag}')
+
     # =========================================================== Control Robot ===========================================================
 
-    def take_dense_action(self, control_seq, save_freq=-1):
+    def take_dense_action(self, control_seq, save_freq=-1, observer_follow_cfg: dict | None = None):
         """
         control_seq:
             left_arm, right_arm, left_gripper, right_gripper
@@ -1417,6 +1745,7 @@ class Base_Task(gym.Env):
         )
 
         save_freq = self.save_freq if save_freq == -1 else save_freq
+        self._update_frame_tracking_tags(observer_follow_cfg)
         if save_freq != None:
             self._take_picture()
 
@@ -1431,7 +1760,11 @@ class Base_Task(gym.Env):
         if right_gripper is not None:
             max_control_len = max(max_control_len, right_gripper["num_step"])
 
+        observer_plan = None
+        observer_plan_idx = 0
+
         for control_idx in range(max_control_len):
+            self._update_frame_tracking_tags(observer_follow_cfg)
 
             if (left_arm is not None and control_idx < left_arm["position"].shape[0]):  # control left arm
                 self.robot.set_arm_joints(
@@ -1461,6 +1794,51 @@ class Base_Task(gym.Env):
                     right_gripper["per_step"],
                 )  # TODO
 
+            if observer_follow_cfg is not None and self.enable_observer_tracking:
+                operator_arm_tag = ArmTag(observer_follow_cfg["operator_arm_tag"])
+                observer_arm_tag = ArmTag(observer_follow_cfg["observer_arm_tag"])
+                tracking_only = bool(observer_follow_cfg.get("tracking_only", False))
+
+                if operator_arm_tag == "left":
+                    operator_busy = left_arm is not None
+                    observer_busy = right_arm is not None if observer_arm_tag == "right" else left_arm is not None
+                else:
+                    operator_busy = right_arm is not None
+                    observer_busy = left_arm is not None if observer_arm_tag == "left" else right_arm is not None
+
+                if operator_busy and not observer_busy:
+                    operator_pose = np.asarray(self.get_arm_pose(operator_arm_tag), dtype=np.float64)
+                    if tracking_only:
+                        pass
+                    else:
+                        update_interval = max(1, int(self.observer_online_update_interval))
+                        should_replan = (
+                            control_idx % update_interval == 0
+                            or observer_plan is None
+                            or observer_plan_idx >= observer_plan["position"].shape[0]
+                        )
+
+                        if should_replan:
+                            observer_target_pose = self._sample_observer_tracking_pose(operator_arm_tag, operator_pose)
+                            observer_plan = (
+                                self.robot.left_plan_path(observer_target_pose)
+                                if observer_arm_tag == "left"
+                                else self.robot.right_plan_path(observer_target_pose)
+                            )
+                            if observer_plan is None or observer_plan.get("status") != "Success":
+                                observer_plan = None
+                                observer_plan_idx = 0
+                            else:
+                                observer_plan_idx = 0
+
+                        if observer_plan is not None and observer_plan_idx < observer_plan["position"].shape[0]:
+                            self.robot.set_arm_joints(
+                                observer_plan["position"][observer_plan_idx],
+                                observer_plan["velocity"][observer_plan_idx],
+                                str(observer_arm_tag),
+                            )
+                            observer_plan_idx += 1
+
             self.scene.step()
 
             if self.render_freq and control_idx % self.render_freq == 0:
@@ -1468,9 +1846,12 @@ class Base_Task(gym.Env):
                 self.viewer.render()
 
             if save_freq != None and control_idx % save_freq == 0:
+                # Refresh tags after stepping so saved frame labels match current robot state.
+                self._update_frame_tracking_tags(observer_follow_cfg)
                 self._update_render()
                 self._take_picture()
 
+        self._update_frame_tracking_tags(observer_follow_cfg)
         if save_freq != None:
             self._take_picture()
 

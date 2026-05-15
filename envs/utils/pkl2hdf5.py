@@ -60,7 +60,21 @@ def create_hdf5_from_dict(hdf5_group, data_dict):
             subgroup = hdf5_group.create_group(key)
             create_hdf5_from_dict(subgroup, value)
         elif isinstance(value, list):
+            # Store string sequences as bytes to avoid h5py unicode dtype conversion errors.
+            if len(value) > 0 and all(isinstance(v, (str, np.str_)) for v in value):
+                encoded = [v.encode("utf-8") for v in value]
+                max_len = max(len(v) for v in encoded)
+                hdf5_group.create_dataset(key, data=encoded, dtype=f"S{max_len}")
+                continue
+
             value = np.array(value)
+            if value.dtype.kind in {"U", "O"}:
+                value_str = value.astype(str).reshape(-1)
+                encoded = [v.encode("utf-8") for v in value_str]
+                max_len = max(len(v) for v in encoded) if len(encoded) > 0 else 1
+                hdf5_group.create_dataset(key, data=encoded, dtype=f"S{max_len}")
+                continue
+
             if "rgb" in key:
                 encode_data, max_len = images_encoding(value)
                 hdf5_group.create_dataset(key, data=encode_data, dtype=f"S{max_len}")
@@ -81,7 +95,17 @@ def pkl_files_to_hdf5_and_video(pkl_files, hdf5_path, video_path):
         pkl_file = load_pkl_file(pkl_file_path)
         append_data_to_structure(data_list, pkl_file)
 
-    images_to_video(np.array(data_list["observation"]["head_camera"]["rgb"]), out_path=video_path)
+    if isinstance(video_path, Mapping):
+        video_targets = dict(video_path)
+    else:
+        video_targets = {"head_camera": video_path}
+
+    observation = data_list.get("observation", {})
+    for camera_name, out_path in video_targets.items():
+        camera_rgb = observation.get(camera_name, {}).get("rgb")
+        if not camera_rgb:
+            continue
+        images_to_video(np.asarray(camera_rgb), out_path=out_path)
 
     with h5py.File(hdf5_path, "w") as f:
         create_hdf5_from_dict(f, data_list)
